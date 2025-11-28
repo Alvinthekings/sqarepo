@@ -1,0 +1,287 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use App\Models\Account;
+use App\Models\Transaction;
+use App\Http\Requests\TransactionRequest;
+
+class DashboardController extends Controller
+{
+    /**
+     * Show the send money page
+     */
+    public function showSendMoneyPage()
+    {
+        $user = Auth::user();
+        $account = $user->account;
+
+        if (!$account) {
+            return redirect()->route('dashboard')->with('error', 'No account found.');
+        }
+
+        return view('send-money', compact('user', 'account'));
+    }
+
+    /**
+     * Show the user dashboard with account details
+     */
+    public function index()
+    {
+        $user = Auth::user();
+        
+        // Get user's primary account
+        $account = $user->account;
+        
+        if (!$account) {
+            // If no account exists, create one (shouldn't happen in normal flow)
+            $account = Account::create([
+                'user_id' => $user->id,
+                'account_number' => Account::generateAccountNumber(),
+                'account_type' => Account::TYPE_SAVINGS,
+                'balance' => 0.00,
+                'available_balance' => 0.00,
+                'status' => Account::STATUS_ACTIVE,
+                'branch_code' => '001001'
+            ]);
+        }
+
+        // Get recent transactions
+        $recentTransactions = $account->getRecentTransactions(5);
+        
+        // Calculate statistics
+        $transactionCount = $account->transactions()->count();
+        $totalDeposits = $account->transactions()
+            ->whereIn('type', [Transaction::TYPE_DEPOSIT, Transaction::TYPE_INITIAL_DEPOSIT, Transaction::TYPE_INTEREST])
+            ->sum('amount');
+        $totalWithdrawals = $account->transactions()
+            ->whereIn('type', [Transaction::TYPE_WITHDRAWAL, Transaction::TYPE_PAYMENT, Transaction::TYPE_FEE])
+            ->sum('amount');
+
+        return view('account-dashboard', compact(
+            'user', 
+            'account', 
+            'recentTransactions', 
+            'transactionCount', 
+            'totalDeposits', 
+            'totalWithdrawals'
+        ));
+    }
+
+    /**
+     * Show all transactions
+     */
+    public function transactions()
+    {
+        $user = Auth::user();
+        $account = $user->account;
+        
+        if (!$account) {
+            return redirect()->route('dashboard')->with('error', 'Account not found.');
+        }
+
+        $transactions = $account->transactions()
+            ->orderBy('created_at', 'desc')
+            ->paginate(20);
+
+        return view('transactions', compact('user', 'account', 'transactions'));
+    }
+
+    /**
+     * Send money to another account
+     */
+    public function sendMoney(TransactionRequest $request)
+    {
+        // Validation is handled by TransactionRequest
+
+        $user = Auth::user();
+        $senderAccount = $user->account;
+
+        if (!$senderAccount || !$senderAccount->isActive()) {
+            return back()->with('error', 'Your account is not available for transactions.');
+        }
+
+        // Find recipient account
+        $recipientAccount = Account::where('account_number', $request->recipient_account)->first();
+        
+        if (!$recipientAccount || !$recipientAccount->isActive()) {
+            return back()->with('error', 'Recipient account not found or inactive.');
+        }
+
+        // Check if trying to send to own account
+        if ($senderAccount->id === $recipientAccount->id) {
+            return back()->with('error', 'Cannot send money to your own account.');
+        }
+
+        // Check sufficient funds
+        if ($senderAccount->balance < $request->amount) {
+            return back()->with('error', 'Insufficient funds. Your current balance is ₱' . number_format($senderAccount->balance, 2));
+        }
+
+        try {
+            \DB::transaction(function() use ($senderAccount, $recipientAccount, $request) {
+                // Generate unique reference for both transactions
+                $reference = 'TRF' . date('Ymd') . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
+                
+                $description = $request->description ?: 'Money Transfer';
+                
+                // Debit from sender
+                $senderAccount->withdraw(
+                    $request->amount,
+                    "Sent to " . $recipientAccount->account_number . ": " . $description,
+                    [
+                        'transfer_type' => 'send',
+                        'recipient_account' => $recipientAccount->account_number,
+                        'recipient_name' => $recipientAccount->user->name,
+                        'reference' => $reference,
+                        'currency' => 'PHP'
+                    ]
+                );
+
+                // Credit to recipient
+                $recipientAccount->deposit(
+                    $request->amount,
+                    "Received from " . $senderAccount->account_number . ": " . $description,
+                    [
+                        'transfer_type' => 'receive',
+                        'sender_account' => $senderAccount->account_number,
+                        'sender_name' => $senderAccount->user->name,
+                        'reference' => $reference,
+                        'currency' => 'PHP'
+                    ]
+                );
+            });
+
+            return back()->with('success', "Successfully sent ₱" . number_format($request->amount, 2) . " to account " . $request->recipient_account);
+            
+        } catch (\Exception $e) {
+            \Log::error('Money transfer failed: ' . $e->getMessage());
+            return back()->with('error', 'Money transfer failed. Please try again.');
+        }
+    }
+
+    /**
+     * Lookup account details for transfer validation
+     */
+    public function lookupAccount(Request $request)
+    {
+        $request->validate([
+            'account_number' => 'required|string'
+        ]);
+
+        $currentUser = Auth::user();
+        $account = Account::with('user')
+            ->where('account_number', $request->account_number)
+            ->first();
+
+        if (!$account) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Account not found',
+                'error_type' => 'not_found'
+            ]);
+        }
+
+        if (!$account->isActive()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Account is inactive and cannot receive transfers',
+                'error_type' => 'inactive'
+            ]);
+        }
+
+        // Check if trying to send to own account
+        if ($account->user_id === $currentUser->id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot send money to your own account',
+                'error_type' => 'self_transfer'
+            ]);
+        }
+
+        return response()->json([
+            'success' => true,
+            'account' => [
+                'account_number' => $account->account_number,
+                'account_holder' => $account->user->name,
+                'account_type' => ucfirst($account->account_type),
+                'status' => $account->status
+            ]
+        ]);
+    }
+
+    /**
+     * Get available accounts for transfer suggestions
+     */
+    public function getAvailableAccounts(Request $request)
+    {
+        $currentUser = Auth::user();
+        
+        $accounts = Account::with('user')
+            ->where('status', Account::STATUS_ACTIVE)
+            ->where('user_id', '!=', $currentUser->id)
+            ->orderBy('updated_at', 'desc')
+            ->limit(10)
+            ->get();
+
+        if ($accounts->isEmpty()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No other active accounts found in the system',
+                'accounts' => []
+            ]);
+        }
+
+        $accountList = $accounts->map(function ($account) {
+            return [
+                'account_number' => $account->account_number,
+                'account_holder' => $account->user->name,
+                'account_type' => ucfirst($account->account_type),
+                'last_active' => $account->updated_at->diffForHumans()
+            ];
+        });
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Available accounts found',
+            'accounts' => $accountList
+        ]);
+    }
+
+    /**
+     * Get recent transfer recipients
+     */
+    public function getRecentRecipients(Request $request)
+    {
+        $currentUser = Auth::user();
+        $account = $currentUser->account;
+
+        if (!$account) {
+            return response()->json(['success' => false, 'recipients' => []]);
+        }
+
+        // Get recent sent transfers
+        $recentTransfers = $account->transactions()
+            ->where('type', Transaction::TYPE_WITHDRAWAL)
+            ->whereJsonContains('metadata->transfer_type', 'send')
+            ->orderBy('created_at', 'desc')
+            ->limit(5)
+            ->get();
+
+        $recipients = $recentTransfers->map(function ($transaction) {
+            return [
+                'account_number' => $transaction->metadata['recipient_account'] ?? 'Unknown',
+                'account_holder' => $transaction->metadata['recipient_name'] ?? 'Unknown',
+                'last_transfer' => $transaction->created_at->format('M j, Y'),
+                'amount' => '₱' . number_format($transaction->amount, 2)
+            ];
+        })->unique('account_number');
+
+        return response()->json([
+            'success' => true,
+            'recipients' => $recipients->values()
+        ]);
+    }
+}
